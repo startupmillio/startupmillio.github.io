@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<title>Platform Fee Playground</title>
+<style>input[type=number] { width: 3em; }</style>
+</head>
+<body>
+<h1>Platform Fee Playground</h1>
+<p>Retailers provide a min price, a retail price and a platform fee % for each product. We set the customer price; the retailer pays us the fee % of it.</p>
+
+<table cellpadding="8">
+<tr>
+<td valign="top">
+<form id="form" onsubmit="return false">
+  <fieldset>
+    <legend>Cart</legend>
+    <p><label>Cart items: <input type="number" id="cartSize" min="1" max="200" step="1" value="3"></label></p>
+    <p><small>Retailer data is sampled uniformly per item:</small></p>
+    <p>
+      Min price: from £<input type="number" id="minLo" min="0" step="0.01" value="5">
+      to £<input type="number" id="minHi" min="0" step="0.01" value="20">
+    </p>
+    <p>
+      Retail (max) price: from £<input type="number" id="retailLo" min="0" step="0.01" value="15">
+      to £<input type="number" id="retailHi" min="0" step="0.01" value="35">
+    </p>
+    <p>
+      Platform fee: from <input type="number" id="feeLo" min="0" max="100" step="0.1" value="5">
+      to <input type="number" id="feeHi" min="0" max="100" step="0.1" value="15"> %
+    </p>
+    <p><label>Simulated carts: <input type="number" id="runs" min="1" max="100000" step="1" value="2000"></label></p>
+    <p><button type="button" id="reroll">Reroll prices</button></p>
+  </fieldset>
+
+  <fieldset>
+    <legend>Customer price</legend>
+    <p><small>Customer price = min + greed × (retail − min). 0 = sell at min price, 1 = sell at retail price.</small></p>
+    <p>
+      <label>Small-cart greed: <input type="range" id="greedMaxRange" min="0" max="1" step="0.01" value="0.8"></label>
+      <input type="number" id="greedMax" min="0" max="1" step="0.01" value="0.8">
+    </p>
+    <p>
+      <label>Big-cart greed: <input type="range" id="greedMinRange" min="0" max="1" step="0.01" value="0.3"></label>
+      <input type="number" id="greedMin" min="0" max="1" step="0.01" value="0.3">
+    </p>
+    <p>
+      Gradually decrease greed from <input type="number" id="posStart" min="1" step="1" value="1" aria-label="Small-cart size">
+      cart items to <input type="number" id="posEnd" min="1" step="1" value="5" aria-label="Big-cart size">
+    </p>
+    <p>
+      <label>Easing between cart sizes:
+        <select id="easing">
+          <option value="linear">Linear</option>
+          <option value="easeInQuad">Ease in (quadratic) — slow start</option>
+          <option value="easeOutQuad">Ease out (quadratic) — fast start</option>
+          <option value="easeInOutQuad">Ease in-out (quadratic)</option>
+          <option value="easeInCubic">Ease in (cubic)</option>
+          <option value="easeOutCubic">Ease out (cubic)</option>
+          <option value="easeInOutCubic">Ease in-out (cubic)</option>
+          <option value="easeInExpo">Ease in (exponential)</option>
+          <option value="easeOutExpo">Ease out (exponential)</option>
+          <option value="step">Step (jump at big-cart size)</option>
+        </select>
+      </label>
+    </p>
+    <p><small>One greed value, set by cart size, applies to every item in the cart.</small></p>
+  </fieldset>
+</form>
+</td>
+<td valign="top">
+<h2>Sample cart</h2>
+<table border="1" cellpadding="4">
+  <thead>
+    <tr>
+      <th>Item</th><th>Min price</th><th>Retail price</th><th>Fee %</th>
+      <th>Customer price</th><th>Platform revenue</th><th>Retailer gets</th><th>Customer saves</th>
+    </tr>
+  </thead>
+  <tbody id="cart"></tbody>
+  <tfoot id="cartTotals"></tfoot>
+</table>
+<p id="cartNotes"></p>
+
+<h2>Multi-cart Simulation</h2>
+<table border="1" cellpadding="4">
+  <thead><tr><th>Metric (per cart)</th><th>Average</th><th>Min</th><th>Max</th></tr></thead>
+  <tbody id="mc"></tbody>
+</table>
+<p id="mcNotes"></p>
+
+<h2>Greed by cart size</h2>
+<table border="1" cellpadding="4">
+  <thead><tr><th>Cart size</th><th>Greed (on every item)</th></tr></thead>
+  <tbody id="schedule"></tbody>
+</table>
+</td>
+</tr>
+</table>
+
+<script>
+const $ = id => document.getElementById(id);
+const gbp = new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP' });
+const money = v => gbp.format(v);
+const pennies = v => Math.round(v * 100) / 100;
+const pct = v => (v * 100).toFixed(1) + '%';
+
+// Fixed between renders so prices stay put while settings change; Reroll picks a new one.
+let seed = 42;
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+const easings = {
+  linear: t => t,
+  easeInQuad: t => t * t,
+  easeOutQuad: t => 1 - (1 - t) * (1 - t),
+  easeInOutQuad: t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2,
+  easeInCubic: t => t * t * t,
+  easeOutCubic: t => 1 - Math.pow(1 - t, 3),
+  easeInOutCubic: t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  easeInExpo: t => t === 0 ? 0 : Math.pow(2, 10 * t - 10),
+  easeOutExpo: t => t === 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  step: t => t < 1 ? 0 : 1,
+};
+
+function num(id, fallback = 0) {
+  const v = parseFloat($(id).value);
+  return Number.isFinite(v) ? v : fallback;
+}
+
+function readParams() {
+  const range = (a, b) => a <= b ? [a, b] : [b, a];
+  const clamp01 = v => Math.min(1, Math.max(0, v));
+  const [minLo, minHi] = range(Math.max(0, num('minLo')), Math.max(0, num('minHi')));
+  let [retailLo, retailHi] = range(Math.max(0, num('retailLo')), Math.max(0, num('retailHi')));
+  // Retail can never be below min: keep the retail range at or above the min range.
+  retailLo = Math.max(retailLo, minLo);
+  retailHi = Math.max(retailHi, minHi);
+  $('retailLo').min = minLo;
+  $('retailHi').min = minHi;
+  const [feeLo, feeHi] = range(clamp01(num('feeLo') / 100), clamp01(num('feeHi') / 100));
+  return {
+    cartSize: Math.max(1, Math.round(num('cartSize', 1))),
+    seed,
+    minLo, minHi, retailLo, retailHi, feeLo, feeHi,
+    greedMax: clamp01(num('greedMax')),
+    greedMin: clamp01(num('greedMin')),
+    posStart: Math.max(1, Math.round(num('posStart', 1))),
+    posEnd: Math.max(1, Math.round(num('posEnd', 1))),
+    easing: $('easing').value,
+    runs: Math.min(100000, Math.max(1, Math.round(num('runs', 1)))),
+  };
+}
+
+// Linear progress from small-cart size (t = 0) to big-cart size (t = 1).
+function progressFor(cartSize, p) {
+  if (p.posEnd <= p.posStart) return cartSize > p.posStart ? 1 : 0;
+  return Math.min(1, Math.max(0, (cartSize - p.posStart) / (p.posEnd - p.posStart)));
+}
+
+function greedFor(cartSize, p) {
+  const e = easings[p.easing](progressFor(cartSize, p));
+  return p.greedMax + (p.greedMin - p.greedMax) * e;
+}
+
+function sampleCart(rng, p) {
+  const greed = greedFor(p.cartSize, p);
+  const items = [];
+  for (let i = 0; i < p.cartSize; i++) {
+    const min = pennies(p.minLo + rng() * (p.minHi - p.minLo));
+    // Sample retail only from the part of the range at or above this item's min price.
+    const lo = Math.max(p.retailLo, min);
+    const retail = pennies(lo + rng() * (Math.max(p.retailHi, min) - lo));
+    const feeRate = p.feeLo + rng() * (p.feeHi - p.feeLo);
+    const price = pennies(min + greed * (retail - min));
+    const fee = pennies(price * feeRate);
+    // Price and fee the same item would have in a small cart, to measure the multi-item discount.
+    const smallPrice = pennies(min + p.greedMax * (retail - min));
+    items.push({
+      pos: i + 1, min, retail, feeRate, price, fee,
+      retailerGets: pennies(price - fee),
+      saving: pennies(retail - price),
+      discount: pennies(smallPrice - price),
+      feeLost: pennies(smallPrice * feeRate - fee),
+    });
+  }
+  return items;
+}
+
+function totals(items) {
+  const sum = k => pennies(items.reduce((s, it) => s + it[k], 0));
+  return {
+    min: sum('min'), retail: sum('retail'), price: sum('price'), fee: sum('fee'),
+    retailerGets: sum('retailerGets'), saving: sum('saving'),
+    discount: sum('discount'), feeLost: sum('feeLost'),
+  };
+}
+
+function renderSchedule(p) {
+  const rows = [];
+  for (let size = 1; size <= p.posEnd; size++) {
+    const current = size === p.cartSize ? ' (current)' : '';
+    rows.push(`<tr><td>${size}${current}</td><td>${greedFor(size, p).toFixed(3)}</td></tr>`);
+  }
+  $('schedule').innerHTML = rows.join('');
+}
+
+function renderCart(p) {
+  const items = sampleCart(mulberry32(p.seed), p);
+  $('cart').innerHTML = items.map(it => `<tr>
+    <td>${it.pos}</td><td>${money(it.min)}</td><td>${money(it.retail)}</td><td>${pct(it.feeRate)}</td>
+    <td>${money(it.price)}</td><td>${money(it.fee)}</td><td>${money(it.retailerGets)}</td><td>${money(it.saving)}</td></tr>`).join('');
+  const t = totals(items);
+  const effFee = t.price > 0 ? t.fee / t.price : 0;
+  $('cartTotals').innerHTML = `<tr>
+    <th>Total</th><th>${money(t.min)}</th><th>${money(t.retail)}</th><th>${pct(effFee)}</th>
+    <th>${money(t.price)}</th><th>${money(t.fee)}</th><th>${money(t.retailerGets)}</th><th>${money(t.saving)}</th></tr>`;
+  $('cartNotes').innerHTML =
+    `Greed for ${p.cartSize} item(s): ${greedFor(p.cartSize, p).toFixed(3)}. ` +
+    `Platform revenue: <b>${money(t.fee)}</b> (${pct(effFee)} of customer price, average ${money(pennies(t.fee / items.length))} per item). ` +
+    `Multi-item discount: customer saves <b>${money(t.discount)}</b> vs small-cart prices, platform gives up ${money(t.feeLost)} of revenue. ` +
+    `Customer saves ${money(t.saving)} (${pct(t.retail > 0 ? t.saving / t.retail : 0)}) vs retail.`;
+}
+
+function renderSimulation(p) {
+  const rng = mulberry32(p.seed + 1);
+  const metrics = {
+    'Customer pays': [], 'Retail total': [], 'Platform revenue': [],
+    'Retailer gets': [], 'Customer saves': [], 'Multi-item discount': [],
+  };
+  for (let r = 0; r < p.runs; r++) {
+    const t = totals(sampleCart(rng, p));
+    metrics['Customer pays'].push(t.price);
+    metrics['Retail total'].push(t.retail);
+    metrics['Platform revenue'].push(t.fee);
+    metrics['Retailer gets'].push(t.retailerGets);
+    metrics['Customer saves'].push(t.saving);
+    metrics['Multi-item discount'].push(t.discount);
+  }
+  const sum = values => values.reduce((a, b) => a + b, 0);
+  $('mc').innerHTML = Object.entries(metrics).map(([name, values]) => {
+    const cells = [sum(values) / values.length, values.reduce((a, b) => Math.min(a, b)), values.reduce((a, b) => Math.max(a, b))];
+    return `<tr><td>${name}</td>${cells.map(v => `<td>${money(v)}</td>`).join('')}</tr>`;
+  }).join('');
+  const fees = sum(metrics['Platform revenue']);
+  const prices = sum(metrics['Customer pays']);
+  const retails = sum(metrics['Retail total']);
+  $('mcNotes').innerHTML =
+    `${p.runs} carts × ${p.cartSize} items. ` +
+    `Effective fee rate: ${pct(prices > 0 ? fees / prices : 0)} of customer price. ` +
+    `Average platform revenue per item: ${money(fees / (p.runs * p.cartSize))}. ` +
+    `Customer saves on average: ${pct(retails > 0 ? 1 - prices / retails : 0)}.`;
+}
+
+function render() {
+  const p = readParams();
+  renderCart(p);
+  renderSimulation(p);
+  renderSchedule(p);
+}
+
+for (const id of ['greedMax', 'greedMin']) {
+  $(id + 'Range').addEventListener('input', () => { $(id).value = $(id + 'Range').value; });
+  $(id).addEventListener('input', () => { $(id + 'Range').value = $(id).value; });
+}
+$('reroll').addEventListener('click', () => {
+  seed = Math.floor(Math.random() * 1e9);
+  render();
+});
+$('form').addEventListener('input', render);
+$('form').addEventListener('change', () => {
+  // Correct the retail fields once editing is done, not mid-typing.
+  if (num('retailLo') < num('minLo')) $('retailLo').value = num('minLo');
+  if (num('retailHi') < num('minHi')) $('retailHi').value = num('minHi');
+  render();
+});
+render();
+</script>
+</body>
+</html>
